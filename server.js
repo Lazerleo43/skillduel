@@ -1,4 +1,4 @@
-const express = require('express');
+onst express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
@@ -19,24 +19,29 @@ const FRICTION = 0.985, WALL_B = 0.55;
 const WIN = 3;
 
 function createDiscs() {
-  const cy = H/2;
   const bp = [
-    {x:W/2,y:PB-80},{x:W/2-55,y:PB-140},{x:W/2+55,y:PB-140},
-    {x:W/2-90,y:PB-210},{x:W/2+90,y:PB-210}
+    {x:W/2,y:GPB-80},{x:W/2-55,y:GPB-140},{x:W/2+55,y:GPB-140},
+    {x:W/2-90,y:GPB-210},{x:W/2+90,y:GPB-210}
   ];
   const rp = [
-    {x:W/2,y:PT+80},{x:W/2-55,y:PT+140},{x:W/2+55,y:PT+140},
-    {x:W/2-90,y:PT+210},{x:W/2+90,y:PT+210}
+    {x:W/2,y:GPT+80},{x:W/2-55,y:GPT+140},{x:W/2+55,y:GPT+140},
+    {x:W/2-90,y:GPT+210},{x:W/2+90,y:GPT+210}
   ];
   const discs = [];
-  bp.forEach((p,i) => discs.push({x:p.x,y:p.y,vx:0,vy:0,r:DISC_R,team:0,id:i}));
-  rp.forEach((p,i) => discs.push({x:p.x,y:p.y,vx:0,vy:0,r:DISC_R,team:1,id:i+5}));
+  bp.forEach((p,i) => discs.push({x:p.x,y:p.y,vx:0,vy:0,r:DISC_R,team:0,id:i,startX:p.x,startY:p.y}));
+  rp.forEach((p,i) => discs.push({x:p.x,y:p.y,vx:0,vy:0,r:DISC_R,team:1,id:i+5,startX:p.x,startY:p.y}));
   return discs;
 }
 
-function dist(a,b){ return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2); }
-
-function resolveCol(a,b){
+function resetAfterGoal(match) {
+  match.ball = {x:W/2, y:H/2, vx:0, vy:0, r:BALL_R};
+  match.discs.forEach(d => {
+    d.x = d.startX;
+    d.y = d.startY;
+    d.vx = 0;
+    d.vy = 0;
+  });
+}
   const dx=b.x-a.x,dy=b.y-a.y,d=dist(a,b),mn=a.r+b.r;
   if(d<mn&&d>0){
     const nx=dx/d,ny=dy/d,ov=(mn-d)/2;
@@ -79,11 +84,6 @@ function allStopped(match) {
   return ![...match.discs, match.ball].some(o => Math.abs(o.vx)>0.08 || Math.abs(o.vy)>0.08);
 }
 
-function resetBall(match) {
-  match.ball = {x:W/2, y:H/2, vx:0, vy:0, r:BALL_R};
-  match.discs.forEach(d => {d.vx=0; d.vy=0;});
-}
-
 function runMatchLoop(matchId) {
   const match = activeMatches[matchId];
   if(!match) return;
@@ -113,7 +113,7 @@ function runMatchLoop(matchId) {
       setTimeout(() => {
         const mm = activeMatches[matchId];
         if(!mm) return;
-        resetBall(mm);
+        resetAfterGoal(mm);
         mm.goalCooldown = 0;
         mm.wasStopped = true;
 
@@ -129,12 +129,14 @@ function runMatchLoop(matchId) {
         io.to(mm.player1).emit('ball_reset', {
           ball: mm.ball,
           score: mm.score,
-          playerTurn: mm.turn === 0
+          playerTurn: mm.turn === 0,
+          discs: mm.discs.map(d=>({id:d.id,x:d.x,y:d.y}))
         });
         io.to(mm.player2).emit('ball_reset', {
           ball: mm.ball,
           score: mm.score,
-          playerTurn: mm.turn === 1
+          playerTurn: mm.turn === 1,
+          discs: mm.discs.map(d=>({id:d.id,x:d.x,y:d.y}))
         });
       }, 1800);
     }
