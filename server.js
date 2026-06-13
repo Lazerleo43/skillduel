@@ -88,6 +88,8 @@ function runMatchLoop(matchId) {
   const match = activeMatches[matchId];
   if(!match) return;
 
+  match.wasStopped = false;
+
   match.interval = setInterval(() => {
     const m = activeMatches[matchId];
     if(!m) { clearInterval(match.interval); return; }
@@ -100,26 +102,21 @@ function runMatchLoop(matchId) {
     if(scoringTeam >= 0 && !m.goalCooldown) {
       m.score[scoringTeam]++;
       m.goalCooldown = 90;
+      m.wasStopped = false;
 
-      // Who goes first after goal = conceding team
       const concedingTeam = scoringTeam === 0 ? 1 : 0;
+      m.turn = concedingTeam; // conceding team goes first
 
-      io.to(m.player1).emit('goal_event', {
-        score: m.score,
-        scoringTeam,
-        playerTurn: concedingTeam === 0 // p1 goes first if conceding=0
-      });
-      io.to(m.player2).emit('goal_event', {
-        score: m.score,
-        scoringTeam,
-        playerTurn: concedingTeam === 1 // p2 goes first if conceding=1
-      });
+      io.to(m.player1).emit('goal_event', { score: m.score, scoringTeam });
+      io.to(m.player2).emit('goal_event', { score: m.score, scoringTeam });
 
       setTimeout(() => {
         const mm = activeMatches[matchId];
         if(!mm) return;
         resetBall(mm);
         mm.goalCooldown = 0;
+        mm.wasStopped = true;
+
         if(mm.score[0]>=WIN || mm.score[1]>=WIN) {
           io.to(mm.player1).emit('match_over_result', {score: mm.score});
           io.to(mm.player2).emit('match_over_result', {score: mm.score});
@@ -127,30 +124,43 @@ function runMatchLoop(matchId) {
           delete activeMatches[matchId];
           return;
         }
-        // Send reset to both
+
+        // Tell each player whose turn it is
         io.to(mm.player1).emit('ball_reset', {
           ball: mm.ball,
           score: mm.score,
-          playerTurn: concedingTeam === 0
+          playerTurn: mm.turn === 0
         });
         io.to(mm.player2).emit('ball_reset', {
           ball: mm.ball,
           score: mm.score,
-          playerTurn: concedingTeam === 1
+          playerTurn: mm.turn === 1
         });
       }, 1800);
     }
 
-    // Broadcast state to both players every tick
+    // Detect when everything stops — switch turns
+    const stopped = allStopped(m);
+    if(stopped && !m.wasStopped && !m.goalCooldown) {
+      m.wasStopped = true;
+      // Switch turn to other player
+      m.turn = m.turn === 0 ? 1 : 0;
+      // Tell each player whose turn it is now
+      io.to(m.player1).emit('your_turn', { playerTurn: m.turn === 0 });
+      io.to(m.player2).emit('your_turn', { playerTurn: m.turn === 1 });
+    } else if(!stopped) {
+      m.wasStopped = false;
+    }
+
+    // Broadcast positions to both players every tick
     const state = {
       ball: m.ball,
-      discs: m.discs.map(d=>({id:d.id,x:d.x,y:d.y,vx:d.vx,vy:d.vy})),
-      stopped: allStopped(m)
+      discs: m.discs.map(d=>({id:d.id,x:d.x,y:d.y,vx:d.vx,vy:d.vy}))
     };
     io.to(m.player1).emit('game_state', state);
     io.to(m.player2).emit('game_state', state);
 
-  }, 1000/60); // 60fps
+  }, 1000/60);
 }
 
 io.on('connection', (socket) => {
