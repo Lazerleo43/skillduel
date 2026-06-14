@@ -10,7 +10,6 @@ const io = new Server(server, { cors: { origin: '*' } });
 let openChallenges = [];
 let activeMatches = {};
 
-// Physics constants
 const W = 340, H = 580;
 const PL = 20, PR = W-20, PT = 44, PB = H-44;
 const GTL = W/2-44, GBL = W/2+44, GW = 20;
@@ -20,12 +19,12 @@ const WIN = 3;
 
 function createDiscs() {
   const bp = [
-    {x:W/2,y:GPB-80},{x:W/2-55,y:GPB-140},{x:W/2+55,y:GPB-140},
-    {x:W/2-90,y:GPB-210},{x:W/2+90,y:GPB-210}
+    {x:W/2,y:PB-80},{x:W/2-55,y:PB-140},{x:W/2+55,y:PB-140},
+    {x:W/2-90,y:PB-210},{x:W/2+90,y:PB-210}
   ];
   const rp = [
-    {x:W/2,y:GPT+80},{x:W/2-55,y:GPT+140},{x:W/2+55,y:GPT+140},
-    {x:W/2-90,y:GPT+210},{x:W/2+90,y:GPT+210}
+    {x:W/2,y:PT+80},{x:W/2-55,y:PT+140},{x:W/2+55,y:PT+140},
+    {x:W/2-90,y:PT+210},{x:W/2+90,y:PT+210}
   ];
   const discs = [];
   bp.forEach((p,i) => discs.push({x:p.x,y:p.y,vx:0,vy:0,r:DISC_R,team:0,id:i,startX:p.x,startY:p.y}));
@@ -35,19 +34,18 @@ function createDiscs() {
 
 function resetAfterGoal(match) {
   match.ball = {x:W/2, y:H/2, vx:0, vy:0, r:BALL_R};
-  match.discs.forEach(d => {
-    d.x = d.startX;
-    d.y = d.startY;
-    d.vx = 0;
-    d.vy = 0;
-  });
+  match.discs.forEach(d => { d.x=d.startX; d.y=d.startY; d.vx=0; d.vy=0; });
 }
-  const dx=b.x-a.x,dy=b.y-a.y,d=dist(a,b),mn=a.r+b.r;
-  if(d<mn&&d>0){
-    const nx=dx/d,ny=dy/d,ov=(mn-d)/2;
-    a.x-=nx*ov;a.y-=ny*ov;b.x+=nx*ov;b.y+=ny*ov;
+
+function dist(a,b) { return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2); }
+
+function resolveCol(a,b) {
+  const dx=b.x-a.x, dy=b.y-a.y, d=dist(a,b), mn=a.r+b.r;
+  if(d<mn && d>0) {
+    const nx=dx/d, ny=dy/d, ov=(mn-d)/2;
+    a.x-=nx*ov; a.y-=ny*ov; b.x+=nx*ov; b.y+=ny*ov;
     const rv=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;
-    if(rv<0){a.vx+=rv*0.85*nx;a.vy+=rv*0.85*ny;b.vx-=rv*0.85*nx;b.vy-=rv*0.85*ny;}
+    if(rv<0) { a.vx+=rv*0.85*nx; a.vy+=rv*0.85*ny; b.vx-=rv*0.85*nx; b.vy-=rv*0.85*ny; }
   }
 }
 
@@ -55,7 +53,8 @@ function physicsStep(match) {
   const all = [...match.discs, match.ball];
   all.forEach(o => {
     o.x+=o.vx; o.y+=o.vy; o.vx*=FRICTION; o.vy*=FRICTION;
-    if(Math.abs(o.vx)<0.02)o.vx=0; if(Math.abs(o.vy)<0.02)o.vy=0;
+    if(Math.abs(o.vx)<0.02) o.vx=0;
+    if(Math.abs(o.vy)<0.02) o.vy=0;
     if(o !== match.ball) {
       if(o.x-o.r<PL){o.x=PL+o.r;o.vx*=-WALL_B;}
       if(o.x+o.r>PR){o.x=PR-o.r;o.vx*=-WALL_B;}
@@ -75,8 +74,8 @@ function physicsStep(match) {
 
 function checkGoal(match) {
   const b = match.ball;
-  if(b.y-b.r<PT-GW && b.x>GTL && b.x<GBL) return 0; // blue scores (top goal)
-  if(b.y+b.r>PB+GW && b.x>GTL && b.x<GBL) return 1; // red scores (bottom goal)
+  if(b.y-b.r<PT-GW && b.x>GTL && b.x<GBL) return 0;
+  if(b.y+b.r>PB+GW && b.x>GTL && b.x<GBL) return 1;
   return -1;
 }
 
@@ -87,7 +86,6 @@ function allStopped(match) {
 function runMatchLoop(matchId) {
   const match = activeMatches[matchId];
   if(!match) return;
-
   match.wasStopped = false;
 
   match.interval = setInterval(() => {
@@ -97,15 +95,13 @@ function runMatchLoop(matchId) {
 
     physicsStep(m);
 
-    // Check goals
     const scoringTeam = checkGoal(m);
-    if(scoringTeam >= 0 && !m.goalCooldown) {
+    if(scoringTeam >= 0) {
       m.score[scoringTeam]++;
       m.goalCooldown = 90;
       m.wasStopped = false;
-
       const concedingTeam = scoringTeam === 0 ? 1 : 0;
-      m.turn = concedingTeam; // conceding team goes first
+      m.turn = concedingTeam;
 
       io.to(m.player1).emit('goal_event', { score: m.score, scoringTeam });
       io.to(m.player2).emit('goal_event', { score: m.score, scoringTeam });
@@ -125,7 +121,6 @@ function runMatchLoop(matchId) {
           return;
         }
 
-        // Tell each player whose turn it is
         io.to(mm.player1).emit('ball_reset', {
           ball: mm.ball,
           score: mm.score,
@@ -141,20 +136,16 @@ function runMatchLoop(matchId) {
       }, 1800);
     }
 
-    // Detect when everything stops — switch turns
     const stopped = allStopped(m);
     if(stopped && !m.wasStopped && !m.goalCooldown) {
       m.wasStopped = true;
-      // Switch turn to other player
       m.turn = m.turn === 0 ? 1 : 0;
-      // Tell each player whose turn it is now
       io.to(m.player1).emit('your_turn', { playerTurn: m.turn === 0 });
       io.to(m.player2).emit('your_turn', { playerTurn: m.turn === 1 });
     } else if(!stopped) {
       m.wasStopped = false;
     }
 
-    // Broadcast positions to both players every tick
     const state = {
       ball: m.ball,
       discs: m.discs.map(d=>({id:d.id,x:d.x,y:d.y,vx:d.vx,vy:d.vy}))
@@ -198,12 +189,12 @@ io.on('connection', (socket) => {
       ball: {x:W/2,y:H/2,vx:0,vy:0,r:BALL_R},
       discs,
       goalCooldown: 0,
-      turn: 0 // 0=player1, 1=player2
+      turn: 0,
+      wasStopped: true
     };
 
     io.to(challenge.socketId).emit('match_start', {matchId, role:'player1', opponent:data.name, stake:challenge.stake});
     io.to(socket.id).emit('match_start', {matchId, role:'player2', opponent:challenge.name, stake:challenge.stake});
-
     setTimeout(() => runMatchLoop(matchId), 500);
   });
 
