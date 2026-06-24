@@ -81,6 +81,22 @@ function authMiddleware(req, res, next) {
 // ---------- STRIPE ----------
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
+// ---------- BANKID (via Idura) ----------
+const IDURA_DOMAIN = process.env.IDURA_DOMAIN; // t.ex. skillduel.test.idura.broker
+const IDURA_CLIENT_ID = process.env.IDURA_CLIENT_ID;
+const IDURA_CLIENT_SECRET = process.env.IDURA_CLIENT_SECRET;
+const APP_BASE_URL = process.env.APP_BASE_URL || 'https://ubiquitous-squirrel-a49b90.netlify.app';
+
+// Tillfällig lagring av state -> userId under BankID-flödet (skyddar mot CSRF, kopplar svaret till rätt användare)
+const bankidStates = {}; // state -> { userId, createdAt }
+
+function cleanupOldStates(){
+  const now = Date.now();
+  Object.keys(bankidStates).forEach(s => {
+    if (now - bankidStates[s].createdAt > 10 * 60 * 1000) delete bankidStates[s]; // 10 min timeout
+  });
+}
+
 // ============ API ROUTES ============
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
@@ -142,6 +158,79 @@ app.get('/api/me', authMiddleware, async (req, res) => {
 app.post('/api/logout', authMiddleware, (req, res) => {
   delete sessions[req.token];
   res.json({ ok: true });
+});
+
+// ---------- BANKID ÅLDERSVERIFIERING ----------
+
+// Steg 1: Klienten anropar denna för att få en BankID-startlänk
+app.post('/api/bankid/start', authMiddleware, (req, res) => {
+  if (!IDURA_DOMAIN || !IDURA_CLIENT_ID) {
+    return res.status(500).json({ error: 'BankID-verifiering är inte konfigurerad ännu' });
+  }
+  cleanupOldStates();
+  const state = crypto.randomBytes(24).toString('hex');
+  bankidStates[state] = { userId: req.userId, createdAt: Date.now() };
+
+  const redirectUri = `${APP_BASE_URL}/bankid-callback.html`;
+  const authorizeUrl = `https://${IDURA_DOMAIN}/oauth2/authorize`
+    + `?response_type=code`
+    + `&client_id=${encodeURIComponent(IDURA_CLIENT_ID)}`
+    + `&redirect_uri=${encodeURIComponent(redirectUri)}`
+    + `&scope=${encodeURIComponent('openid is_over_18')}`
+    + `&state=${encodeURIComponent(state)}`
+    + `&acr_values=${encodeURIComponent('urn:grn:authn:se:bankid')}`;
+
+  res.json({ url: authorizeUrl });
+});
+
+// Steg 2: Idura skickar tillbaka användaren till frontend med ?code=...&state=...
+// Frontend (bankid-callback.html) skickar code+state hit för att slutföra verifieringen
+app.post('/api/bankid/callback', async (req, res) => {
+  try {
+    const { code, state } = req.body;
+    if (!code || !state) return res.status(400).json({ error: 'Saknar code eller state' });
+
+    const stateData = bankidStates[state];
+    if (!stateData) return res.status(400).json({ error: 'Ogiltig eller utgången session — försök igen' });
+    delete bankidStates[state]; // engångsbruk
+
+    // Växla authorization code mot ett id_token via Iduras token-endpoint
+    const tokenRes = await fetch(`https://${IDURA_DOMAIN}/oauth2/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: `${APP_BASE_URL}/bankid-callback.html`,
+        client_id: IDURA_CLIENT_ID,
+        client_secret: IDURA_CLIENT_SECRET
+      })
+    });
+
+    const tokenData = await tokenRes.json();
+    if (!tokenRes.ok || !tokenData.id_token) {
+      console.error('BankID token-fel:', tokenData);
+      return res.status(400).json({ error: 'Kunde inte verifiera BankID-svaret' });
+    }
+
+    // Avkoda JWT-payload (vi litar på Idura/HTTPS-kanalen; för extra säkerhet kan signaturverifiering läggas till senare)
+    const payloadB64 = tokenData.id_token.split('.')[1];
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
+
+    const isOver18 = payload.is_over_18 === true || payload.is_over_18 === 'true';
+    if (!isOver18) {
+      return res.status(403).json({ error: 'Du måste vara 18 år eller äldre för att använda SkillDuel' });
+    }
+
+    await pool.query('UPDATE users SET age_verified=TRUE WHERE id=$1', [stateData.userId]);
+    const user = await getUserFromToken(req.headers.authorization ? req.headers.authorization.replace('Bearer ','') : null)
+      || (await pool.query('SELECT id, email, display_name, balance_cents, age_verified FROM users WHERE id=$1', [stateData.userId])).rows[0];
+
+    res.json({ ok: true, user });
+  } catch (e) {
+    console.error('BankID callback-fel:', e);
+    res.status(500).json({ error: 'Något gick fel vid åldersverifieringen' });
+  }
 });
 
 // Skapa Stripe Checkout-session för insättning
