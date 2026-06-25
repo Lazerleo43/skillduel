@@ -29,9 +29,12 @@ async function initDb() {
       display_name TEXT NOT NULL,
       balance_cents INTEGER NOT NULL DEFAULT 0,
       age_verified BOOLEAN NOT NULL DEFAULT FALSE,
+      is_admin BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
   `);
+  // Lägg till is_admin-kolumnen om tabellen redan fanns innan denna uppdatering
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
@@ -41,6 +44,24 @@ async function initDb() {
       stripe_session_id TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS matches (
+      id SERIAL PRIMARY KEY,
+      match_id TEXT UNIQUE NOT NULL,
+      player1_user_id INTEGER REFERENCES users(id),
+      player2_user_id INTEGER REFERENCES users(id),
+      player1_name TEXT,
+      player2_name TEXT,
+      stake_kr NUMERIC,
+      final_score_p1 INTEGER,
+      final_score_p2 INTEGER,
+      winner_user_id INTEGER REFERENCES users(id),
+      events JSONB NOT NULL DEFAULT '[]',
+      refunded BOOLEAN NOT NULL DEFAULT FALSE,
+      started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      ended_at TIMESTAMP
     );
   `);
   console.log('Databas redo');
@@ -67,12 +88,21 @@ function genToken() {
 async function getUserFromToken(token) {
   const userId = sessions[token];
   if (!userId) return null;
-  const r = await pool.query('SELECT id, email, display_name, balance_cents, age_verified FROM users WHERE id=$1', [userId]);
+  const r = await pool.query('SELECT id, email, display_name, balance_cents, age_verified, is_admin FROM users WHERE id=$1', [userId]);
   return r.rows[0] || null;
 }
 function authMiddleware(req, res, next) {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   if (!token || !sessions[token]) return res.status(401).json({ error: 'Ej inloggad' });
+  req.userId = sessions[token];
+  req.token = token;
+  next();
+}
+async function adminMiddleware(req, res, next) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  if (!token || !sessions[token]) return res.status(401).json({ error: 'Ej inloggad' });
+  const user = await getUserFromToken(token);
+  if (!user || !user.is_admin) return res.status(403).json({ error: 'Endast administratörer har åtkomst' });
   req.userId = sessions[token];
   req.token = token;
   next();
@@ -301,12 +331,88 @@ app.post('/api/deposit/confirm', authMiddleware, async (req, res) => {
 });
 
 // Transaktionshistorik
+// Engångs-endpoint för att göra ditt eget konto till admin första gången
+// Skyddad med ADMIN_BOOTSTRAP_SECRET (miljövariabel) — använd en gång, sätt sen valfritt bort variabeln
+app.post('/api/admin/bootstrap', authMiddleware, async (req, res) => {
+  try {
+    const { secret } = req.body;
+    if (!process.env.ADMIN_BOOTSTRAP_SECRET || secret !== process.env.ADMIN_BOOTSTRAP_SECRET) {
+      return res.status(403).json({ error: 'Fel hemlig nyckel' });
+    }
+    await pool.query('UPDATE users SET is_admin=TRUE WHERE id=$1', [req.userId]);
+    res.json({ ok: true, message: 'Ditt konto är nu admin' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Något gick fel' });
+  }
+});
+
 app.get('/api/transactions', authMiddleware, async (req, res) => {
   const r = await pool.query(
     'SELECT id, type, amount_cents, status, created_at FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50',
     [req.userId]
   );
   res.json({ transactions: r.rows });
+});
+
+// ============ ADMIN: MATCHGRANSKNING & ÅTERBETALNING ============
+
+// Lista alla matcher (senaste först), med grundinfo för admin-översikten
+app.get('/api/admin/matches', adminMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT match_id, player1_name, player2_name, stake_kr, final_score_p1, final_score_p2,
+             winner_user_id, refunded, started_at, ended_at
+      FROM matches
+      ORDER BY started_at DESC
+      LIMIT 200
+    `);
+    res.json({ matches: r.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Kunde inte hämta matcher' });
+  }
+});
+
+// Hämta en specifik match med fullständig replay-logg
+app.get('/api/admin/matches/:matchId', adminMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM matches WHERE match_id=$1', [req.params.matchId]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Match hittades inte' });
+    res.json({ match: r.rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Kunde inte hämta match' });
+  }
+});
+
+// Återbetala insatsen till en spelare (vid bugg/fel i spelet)
+app.post('/api/admin/matches/:matchId/refund', adminMiddleware, async (req, res) => {
+  try {
+    const { userId } = req.body; // vilken spelare som ska få pengarna tillbaka
+    if (!userId) return res.status(400).json({ error: 'Saknar userId' });
+
+    const matchR = await pool.query('SELECT * FROM matches WHERE match_id=$1', [req.params.matchId]);
+    const match = matchR.rows[0];
+    if (!match) return res.status(404).json({ error: 'Match hittades inte' });
+    if (match.refunded) return res.status(400).json({ error: 'Denna match har redan återbetalats' });
+
+    const stakeCents = Math.round(parseFloat(match.stake_kr) * 100);
+    if (!stakeCents || stakeCents <= 0) return res.status(400).json({ error: 'Ogiltig insats för återbetalning' });
+
+    // Återbetala insatsen till den angivna spelaren
+    await pool.query('UPDATE users SET balance_cents = balance_cents + $1 WHERE id=$2', [stakeCents, userId]);
+    await pool.query(
+      'INSERT INTO transactions (user_id, type, amount_cents, status) VALUES ($1,$2,$3,$4)',
+      [userId, 'admin_refund', stakeCents, 'completed']
+    );
+    await pool.query('UPDATE matches SET refunded=TRUE WHERE match_id=$1', [req.params.matchId]);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Kunde inte genomföra återbetalning' });
+  }
 });
 
 // ============ SPELLOGIK (oförändrad fysik) ============
@@ -340,6 +446,7 @@ function runMatchLoop(matchId){
       mm.wasStopped=false;
       const ct=st===0?1:0;
       mm.turn=ct;
+      mm.events.push({ t: Date.now()-mm.matchStartTime, type:'goal', scoringTeam: st, score: [...mm.score] });
       io.to(mm.player1).emit('goal_event',{score:mm.score,scoringTeam:st,playerTurn: mm.player1Team===ct});
       io.to(mm.player2).emit('goal_event',{score:mm.score,scoringTeam:st,playerTurn: mm.player2Team===ct});
       setTimeout(()=>{
@@ -400,6 +507,17 @@ async function settleMatch(matchId, mm){
 
   io.to(mm.player1).emit('match_over_result',{score:mm.score, newBalanceCents: p1User ? p1User.rows[0].balance_cents : null});
   io.to(mm.player2).emit('match_over_result',{score:mm.score, newBalanceCents: p2User ? p2User.rows[0].balance_cents : null});
+
+  // Spara slutresultat och fullständig replay-logg i databasen för admin-granskning
+  try {
+    await pool.query(
+      `UPDATE matches SET final_score_p1=$1, final_score_p2=$2, winner_user_id=$3, events=$4, ended_at=NOW() WHERE match_id=$5`,
+      [mm.score[0], mm.score[1], winnerUserId || null, JSON.stringify(mm.events), matchId]
+    );
+  } catch (e) {
+    console.error('Kunde inte spara matchresultat i databasen:', e);
+  }
+
   delete activeMatches[matchId];
 }
 
@@ -461,6 +579,8 @@ io.on('connection',(socket)=>{
       player2:socket.id,
       player1UserId: challenge.userId,
       player2UserId: data.userId,
+      player1Name: challenge.name,
+      player2Name: data.name,
       player1Team: 0,
       player2Team: 1,
       stake:challenge.stake,
@@ -469,10 +589,24 @@ io.on('connection',(socket)=>{
       discs,
       goalCooldown:0,
       turn:0,
-      wasStopped:true
+      wasStopped:true,
+      events:[], // replay-logg: alla skott och mål med tidsstämpel (ms sedan matchstart)
+      matchStartTime: Date.now()
     };
     io.to(challenge.socketId).emit('match_start',{matchId,role:'player1',opponent:data.name,stake:challenge.stake});
     io.to(socket.id).emit('match_start',{matchId,role:'player2',opponent:challenge.name,stake:challenge.stake});
+
+    // Spara matchen i databasen direkt vid start (uppdateras senare med slutresultat)
+    try {
+      await pool.query(
+        `INSERT INTO matches (match_id, player1_user_id, player2_user_id, player1_name, player2_name, stake_kr, events)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [matchId, challenge.userId, data.userId, challenge.name, data.name, challenge.stake, JSON.stringify([])]
+      );
+    } catch (e) {
+      console.error('Kunde inte spara match i databasen:', e);
+    }
+
     setTimeout(()=>runMatchLoop(matchId),500);
   });
 
@@ -483,6 +617,14 @@ io.on('connection',(socket)=>{
     if(!disc)return;
     disc.vx=data.vx;
     disc.vy=data.vy;
+    // Logga skottet för replay: tid, vilken sten, från vilken position, med vilken hastighet
+    match.events.push({
+      t: Date.now() - match.matchStartTime,
+      type: 'shot',
+      discId: data.discId,
+      x: disc.x, y: disc.y,
+      vx: data.vx, vy: data.vy
+    });
   });
 
   socket.on('disconnect',()=>{
