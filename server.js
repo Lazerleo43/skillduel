@@ -339,8 +339,10 @@ app.post('/api/admin/bootstrap', authMiddleware, async (req, res) => {
     if (!process.env.ADMIN_BOOTSTRAP_SECRET || secret !== process.env.ADMIN_BOOTSTRAP_SECRET) {
       return res.status(403).json({ error: 'Fel hemlig nyckel' });
     }
-    await pool.query('UPDATE users SET is_admin=TRUE WHERE id=$1', [req.userId]);
-    res.json({ ok: true, message: 'Ditt konto är nu admin' });
+    // Sätter både admin-status och åldersverifiering — praktiskt under testfasen
+    // innan riktig BankID-produktion är aktiverad.
+    await pool.query('UPDATE users SET is_admin=TRUE, age_verified=TRUE WHERE id=$1', [req.userId]);
+    res.json({ ok: true, message: 'Ditt konto är nu admin och åldersverifierat' });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Något gick fel' });
