@@ -5,6 +5,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const Stripe = require('stripe');
+const webpush = require('web-push');
 
 const app = express();
 app.use(cors());
@@ -12,6 +13,17 @@ app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
+
+// ---------- WEB PUSH (notiser till registrerade användare) ----------
+// VAPID-nycklar identifierar din server mot webbläsarnas push-tjänster.
+// VAPID_PUBLIC_KEY måste även finnas i frontend (index.html) för att be om prenumeration.
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails('mailto:admin@skillduel.se', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} else {
+  console.warn('VAPID-nycklar saknas — push-notiser är avstängda tills VAPID_PUBLIC_KEY och VAPID_PRIVATE_KEY är satta.');
+}
 
 // ---------- DATABAS ----------
 const pool = new Pool({
@@ -62,6 +74,17 @@ async function initDb() {
       refunded BOOLEAN NOT NULL DEFAULT FALSE,
       started_at TIMESTAMP NOT NULL DEFAULT NOW(),
       ended_at TIMESTAMP
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      endpoint TEXT NOT NULL,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE(user_id, endpoint)
     );
   `);
   console.log('Databas redo');
@@ -130,6 +153,80 @@ function cleanupOldStates(){
 // ============ API ROUTES ============
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// ---------- PUSH NOTIFICATIONS ----------
+
+// Frontend hämtar denna publika nyckel för att be webbläsaren om en prenumeration
+app.get('/api/push/vapid-public-key', (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC_KEY || null });
+});
+
+// Spara en push-prenumeration för den inloggade användaren
+app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const { endpoint, keys } = req.body;
+    if (!endpoint || !keys || !keys.p256dh || !keys.auth) {
+      return res.status(400).json({ error: 'Ogiltig prenumerationsdata' });
+    }
+    await pool.query(
+      `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (user_id, endpoint) DO UPDATE SET p256dh=$3, auth=$4`,
+      [req.userId, endpoint, keys.p256dh, keys.auth]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Kunde inte spara push-prenumeration:', e);
+    res.status(500).json({ error: 'Något gick fel' });
+  }
+});
+
+// Ta bort en prenumeration (t.ex. om användaren stänger av notiser)
+app.post('/api/push/unsubscribe', authMiddleware, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    if (endpoint) {
+      await pool.query('DELETE FROM push_subscriptions WHERE user_id=$1 AND endpoint=$2', [req.userId, endpoint]);
+    } else {
+      await pool.query('DELETE FROM push_subscriptions WHERE user_id=$1', [req.userId]);
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Något gick fel' });
+  }
+});
+
+// Skickar en push-notis till ALLA registrerade prenumerationer (utom avsändaren själv)
+// Tar bort prenumerationer som inte längre är giltiga (404/410 från push-tjänsten)
+async function broadcastPushNotification(title, body, excludeUserId, urlToOpen) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return; // push ej konfigurerat
+  try {
+    const r = await pool.query(
+      excludeUserId
+        ? 'SELECT id, user_id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id != $1'
+        : 'SELECT id, user_id, endpoint, p256dh, auth FROM push_subscriptions',
+      excludeUserId ? [excludeUserId] : []
+    );
+    const payload = JSON.stringify({ title, body, url: urlToOpen || '/' });
+    for (const sub of r.rows) {
+      const pushSub = {
+        endpoint: sub.endpoint,
+        keys: { p256dh: sub.p256dh, auth: sub.auth }
+      };
+      webpush.sendNotification(pushSub, payload).catch(async (err) => {
+        // Prenumerationen är inte längre giltig (användaren har t.ex. avinstallerat/blockerat) — rensa bort den
+        if (err.statusCode === 404 || err.statusCode === 410) {
+          await pool.query('DELETE FROM push_subscriptions WHERE id=$1', [sub.id]).catch(()=>{});
+        } else {
+          console.error('Push-fel för subscription', sub.id, ':', err.message);
+        }
+      });
+    }
+  } catch (e) {
+    console.error('Kunde inte broadcasta push-notiser:', e);
+  }
+}
 
 // Registrering
 app.post('/api/register', async (req, res) => {
@@ -249,7 +346,7 @@ app.post('/api/bankid/callback', async (req, res) => {
 
     const isOver18 = payload.is_over_18 === true || payload.is_over_18 === 'true';
     if (!isOver18) {
-      return res.status(403).json({ error: 'Du måste vara 18 år eller äldre för att använda SkillDuel' });
+      return res.status(403).json({ error: 'Du måste vara 18 år eller äldre för att använda Toosome' });
     }
 
     await pool.query('UPDATE users SET age_verified=TRUE WHERE id=$1', [stateData.userId]);
@@ -279,7 +376,7 @@ app.post('/api/deposit/create-session', authMiddleware, async (req, res) => {
       line_items: [{
         price_data: {
           currency: 'sek',
-          product_data: { name: 'Insättning till SkillDuel-saldo' },
+          product_data: { name: 'Insättning till Toosome-saldo' },
           unit_amount: amount * 100
         },
         quantity: 1
@@ -535,6 +632,13 @@ io.on('connection',(socket)=>{
     openChallenges.push({id:socket.id,name:data.name,stake:data.stake,socketId:socket.id,userId:data.userId});
     io.emit('challenges_list',openChallenges);
     io.emit('new_challenge',{name:data.name,stake:data.stake});
+    // Skicka push-notis till alla registrerade användare (utom den som skapade utmaningen)
+    broadcastPushNotification(
+      '⚽ Ny match väntar!',
+      data.name + ' söker en motspelare — insats ' + data.stake + ' kr. Tryck för att spela!',
+      data.userId,
+      '/'
+    ).catch(console.error);
   });
 
   socket.on('cancel_challenge',()=>{
