@@ -421,56 +421,16 @@ app.post('/api/admin/matches/:matchId/refund', adminMiddleware, async (req, res)
 
 let openChallenges = [];
 let activeMatches = {};
-const W=340,H=580,PL=20,PR=320,PT=44,PB=536,GTL=126,GBL=214,GW=20,DISC_R=18,BALL_R=11,FRICTION=0.985,BALL_FRICTION=0.991,WALL_B=0.6,WIN=3;
+const W=340,H=580,PL=20,PR=320,PT=44,PB=536,GTL=126,GBL=214,GW=20,DISC_R=18,BALL_R=11,FRICTION=0.985,WALL_B=0.55,WIN=3;
 
 function createDiscs(){const bp=[{x:170,y:456},{x:115,y:396},{x:225,y:396},{x:80,y:326},{x:260,y:326}];const rp=[{x:170,y:124},{x:115,y:184},{x:225,y:184},{x:80,y:254},{x:260,y:254}];const d=[];bp.forEach((p,i)=>d.push({x:p.x,y:p.y,vx:0,vy:0,r:DISC_R,team:0,id:i,startX:p.x,startY:p.y}));rp.forEach((p,i)=>d.push({x:p.x,y:p.y,vx:0,vy:0,r:DISC_R,team:1,id:i+5,startX:p.x,startY:p.y}));return d;}
 function resetAfterGoal(m){m.ball={x:170,y:290,vx:0,vy:0,r:BALL_R};m.discs.forEach(d=>{d.x=d.startX;d.y=d.startY;d.vx=0;d.vy=0;});m.ballTouched=false;}
 function dist(a,b){return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2);}
-function resolveCol(a,b,m){
-  const dx=b.x-a.x,dy=b.y-a.y,d=dist(a,b),mn=a.r+b.r;
-  if(d<mn&&d>0){
-    const nx=dx/d,ny=dy/d,ov=(mn-d)/2;
-    a.x-=nx*ov;a.y-=ny*ov;b.x+=nx*ov;b.y+=ny*ov;
-    const rv=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;
-    if(rv<0){
-      // Bollen är lättare än stenarna — en träffande sten behåller mer av sin egen fart
-      // medan bollen får en kraftigare knuff i sin riktning (mer verklighetstroget och dramatiskt skott mot mål)
-      const isBallA = m && a===m.ball, isBallB = m && b===m.ball;
-      const restitution = 0.88; // studsstyrka i kollisionen
-      if(isBallA){
-        a.vx+=rv*1.55*nx; a.vy+=rv*1.55*ny;
-        b.vx-=rv*0.35*nx; b.vy-=rv*0.35*ny;
-      } else if(isBallB){
-        a.vx+=rv*0.35*nx; a.vy+=rv*0.35*ny;
-        b.vx-=rv*1.55*nx; b.vy-=rv*1.55*ny;
-      } else {
-        a.vx+=rv*restitution*nx; a.vy+=rv*restitution*ny;
-        b.vx-=rv*restitution*nx; b.vy-=rv*restitution*ny;
-      }
-    }
-    // Markera att bollen blivit träffad av en sten (inte bara sten-mot-sten-kollision) — krävs innan mål kan räknas
-    if(m && (a===m.ball || b===m.ball)) m.ballTouched=true;
-  }
-}
-function physicsStep(m){
-  const all=[...m.discs,m.ball];
-  all.forEach(o=>{
-    o.x+=o.vx;o.y+=o.vy;
-    const fr = (o===m.ball) ? BALL_FRICTION : FRICTION; // bollen rullar längre/lättare än stenarna
-    o.vx*=fr;o.vy*=fr;
-    if(Math.abs(o.vx)<0.02)o.vx=0;if(Math.abs(o.vy)<0.02)o.vy=0;
-    if(o!==m.ball){
-      if(o.x-o.r<PL){o.x=PL+o.r;o.vx*=-WALL_B;}if(o.x+o.r>PR){o.x=PR-o.r;o.vx*=-WALL_B;}
-      if(o.y-o.r<PT){o.y=PT+o.r;o.vy*=-WALL_B;}if(o.y+o.r>PB){o.y=PB-o.r;o.vy*=-WALL_B;}
-    }else{
-      const iT=o.y-o.r<PT&&o.x>GTL&&o.x<GBL;const iB=o.y+o.r>PB&&o.x>GTL&&o.x<GBL;
-      if(o.x-o.r<PL){o.x=PL+o.r;o.vx*=-WALL_B;}if(o.x+o.r>PR){o.x=PR-o.r;o.vx*=-WALL_B;}
-      if(!iT){if(o.y-o.r<PT){o.y=PT+o.r;o.vy*=-WALL_B;}}
-      if(!iB){if(o.y+o.r>PB){o.y=PB-o.r;o.vy*=-WALL_B;}}
-    }
-  });
-  for(let i=0;i<all.length;i++)for(let j=i+1;j<all.length;j++)resolveCol(all[i],all[j],m);
-}
+function resolveCol(a,b,m){const dx=b.x-a.x,dy=b.y-a.y,d=dist(a,b),mn=a.r+b.r;if(d<mn&&d>0){const nx=dx/d,ny=dy/d,ov=(mn-d)/2;a.x-=nx*ov;a.y-=ny*ov;b.x+=nx*ov;b.y+=ny*ov;const rv=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;if(rv<0){a.vx+=rv*0.85*nx;a.vy+=rv*0.85*ny;b.vx-=rv*0.85*nx;b.vy-=rv*0.85*ny;}
+  // Markera att bollen blivit träffad av en sten (inte bara sten-mot-sten-kollision) — krävs innan mål kan räknas
+  if(m && (a===m.ball || b===m.ball)) m.ballTouched=true;
+}}
+function physicsStep(m){const all=[...m.discs,m.ball];all.forEach(o=>{o.x+=o.vx;o.y+=o.vy;o.vx*=FRICTION;o.vy*=FRICTION;if(Math.abs(o.vx)<0.02)o.vx=0;if(Math.abs(o.vy)<0.02)o.vy=0;if(o!==m.ball){if(o.x-o.r<PL){o.x=PL+o.r;o.vx*=-WALL_B;}if(o.x+o.r>PR){o.x=PR-o.r;o.vx*=-WALL_B;}if(o.y-o.r<PT){o.y=PT+o.r;o.vy*=-WALL_B;}if(o.y+o.r>PB){o.y=PB-o.r;o.vy*=-WALL_B;}}else{const iT=o.y-o.r<PT&&o.x>GTL&&o.x<GBL;const iB=o.y+o.r>PB&&o.x>GTL&&o.x<GBL;if(o.x-o.r<PL){o.x=PL+o.r;o.vx*=-WALL_B;}if(o.x+o.r>PR){o.x=PR-o.r;o.vx*=-WALL_B;}if(!iT){if(o.y-o.r<PT){o.y=PT+o.r;o.vy*=-WALL_B;}}if(!iB){if(o.y+o.r>PB){o.y=PB-o.r;o.vy*=-WALL_B;}}}});for(let i=0;i<all.length;i++)for(let j=i+1;j<all.length;j++)resolveCol(all[i],all[j],m);}
 function checkGoal(m){
   // Inget mål kan räknas förrän bollen faktiskt blivit träffad av en sten sedan senaste avsparken
   if(!m.ballTouched) return -1;
