@@ -42,6 +42,128 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 
 app.use(express.json());
 
+// ---------- PAYPAL ----------
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+// Sätt till 'live' när PayPal godkänt kontot, 'sandbox' under testfas
+const PAYPAL_MODE = process.env.PAYPAL_MODE || 'sandbox';
+const PAYPAL_BASE = PAYPAL_MODE === 'live'
+  ? 'https://api-m.paypal.com'
+  : 'https://api-m.sandbox.paypal.com';
+
+async function getPayPalAccessToken() {
+  const res = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': 'Basic ' + Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64')
+    },
+    body: 'grant_type=client_credentials'
+  });
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Kunde inte hämta PayPal access token');
+  return data.access_token;
+}
+
+// Skapa PayPal-order för insättning
+app.post('/api/paypal/create-order', authMiddleware, async (req, res) => {
+  try {
+    if (!PAYPAL_CLIENT_ID) return res.status(500).json({ error: 'PayPal ej konfigurerat' });
+    const { amountKr } = req.body;
+    const amount = parseInt(amountKr, 10);
+    if (!amount || amount < 10 || amount > 5000) {
+      return res.status(400).json({ error: 'Belopp måste vara mellan 10 och 5000 kr' });
+    }
+    const token = await getPayPalAccessToken();
+    const orderRes = await fetch(`${PAYPAL_BASE}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        intent: 'CAPTURE',
+        purchase_units: [{
+          amount: {
+            currency_code: 'SEK',
+            value: amount.toFixed(2)
+          },
+          description: `Insättning till Toosome-saldo — ${amount} kr`
+        }],
+        application_context: {
+          brand_name: 'Toosome',
+          landing_page: 'NO_PREFERENCE',
+          user_action: 'PAY_NOW',
+          return_url: `${process.env.APP_BASE_URL || 'https://toosome.com'}/?paypal=success`,
+          cancel_url: `${process.env.APP_BASE_URL || 'https://toosome.com'}/?paypal=cancel`
+        }
+      })
+    });
+    const order = await orderRes.json();
+    if (!orderRes.ok || !order.id) {
+      console.error('PayPal create-order fel:', order);
+      return res.status(500).json({ error: 'Kunde inte skapa PayPal-order' });
+    }
+    // Spara pending transaktion
+    await pool.query(
+      'INSERT INTO transactions (user_id, type, amount_cents, stripe_session_id, status) VALUES ($1,$2,$3,$4,$5)',
+      [req.userId, 'deposit', amount * 100, `pp_${order.id}`, 'pending']
+    );
+    res.json({ orderId: order.id });
+  } catch (e) {
+    console.error('PayPal create-order error:', e);
+    res.status(500).json({ error: 'Något gick fel' });
+  }
+});
+
+// Bekräfta och capture:a PayPal-order efter att spelaren betalat
+app.post('/api/paypal/capture-order', authMiddleware, async (req, res) => {
+  try {
+    if (!PAYPAL_CLIENT_ID) return res.status(500).json({ error: 'PayPal ej konfigurerat' });
+    const { orderId } = req.body;
+    if (!orderId) return res.status(400).json({ error: 'Saknar orderId' });
+
+    const token = await getPayPalAccessToken();
+    const captureRes = await fetch(`${PAYPAL_BASE}/v2/checkout/orders/${orderId}/capture`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      }
+    });
+    const capture = await captureRes.json();
+
+    if (!captureRes.ok || capture.status !== 'COMPLETED') {
+      console.error('PayPal capture fel:', capture);
+      return res.status(400).json({ error: 'Betalningen kunde inte bekräftas' });
+    }
+
+    // Kreditera saldot
+    const amountStr = capture.purchase_units?.[0]?.payments?.captures?.[0]?.amount?.value;
+    const amountCents = Math.round(parseFloat(amountStr) * 100);
+
+    // Kontrollera att ordern tillhör denna användare
+    const txCheck = await pool.query('SELECT * FROM transactions WHERE stripe_session_id=$1', [`pp_${orderId}`]);
+    const tx = txCheck.rows[0];
+    if (!tx || tx.user_id !== req.userId) {
+      return res.status(403).json({ error: 'Order tillhör inte denna användare' });
+    }
+    if (tx.status === 'completed') {
+      const user = await getUserFromToken(req.token);
+      return res.json({ ok: true, alreadyProcessed: true, user });
+    }
+
+    await pool.query('UPDATE transactions SET status=$1 WHERE stripe_session_id=$2', ['completed', `pp_${orderId}`]);
+    await pool.query('UPDATE users SET balance_cents = balance_cents + $1 WHERE id=$2', [amountCents, req.userId]);
+
+    const user = await getUserFromToken(req.token);
+    res.json({ ok: true, user });
+  } catch (e) {
+    console.error('PayPal capture error:', e);
+    res.status(500).json({ error: 'Något gick fel' });
+  }
+});
+
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
@@ -106,6 +228,19 @@ async function initDb() {
     );
   `);
   await pool.query(`INSERT INTO house_account (id, balance_cents) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;`);
+
+  // Uttags-begäranden från spelare
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS withdrawals (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      amount_cents INTEGER NOT NULL,
+      iban TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMP
+    );
+  `);
   console.log('Databas redo');
 }
 
@@ -441,7 +576,106 @@ app.post('/api/admin/matches/:matchId/refund', adminMiddleware, async (req, res)
   }
 });
 
-// ============ SPELLOGIK ============
+// ---------- UTTAG ----------
+
+// Spelare begär uttag — låser saldot och skapar en pending uttags-rad
+app.post('/api/withdraw/request', authMiddleware, async (req, res) => {
+  try {
+    const { amountKr, iban } = req.body;
+    const amount = parseInt(amountKr, 10);
+    if (!amount || amount < 20) return res.status(400).json({ error: 'Minsta uttag är 20 kr' });
+    if (!iban || !iban.toUpperCase().startsWith('SE') || iban.replace(/\s/g,'').length < 15) {
+      return res.status(400).json({ error: 'Ogiltigt IBAN' });
+    }
+    const amountCents = amount * 100;
+
+    // Kontrollera saldo
+    const userR = await pool.query('SELECT balance_cents FROM users WHERE id=$1', [req.userId]);
+    const user = userR.rows[0];
+    if (!user || user.balance_cents < amountCents) {
+      return res.status(400).json({ error: 'Otillräckligt saldo' });
+    }
+
+    // Dra av saldot direkt (låst tills admin hanterar det)
+    await pool.query('UPDATE users SET balance_cents = balance_cents - $1 WHERE id=$2', [amountCents, req.userId]);
+
+    // Spara uttags-begäran
+    await pool.query(
+      'INSERT INTO withdrawals (user_id, amount_cents, iban, status) VALUES ($1,$2,$3,$4)',
+      [req.userId, amountCents, iban.replace(/\s/g,'').toUpperCase(), 'pending']
+    );
+    await pool.query(
+      'INSERT INTO transactions (user_id, type, amount_cents, status) VALUES ($1,$2,$3,$4)',
+      [req.userId, 'withdrawal_pending', -amountCents, 'pending']
+    );
+
+    const updatedUser = await getUserFromToken(req.token);
+    res.json({ ok: true, user: updatedUser });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Något gick fel' });
+  }
+});
+
+// Admin: lista alla uttags-begäranden
+app.get('/api/admin/withdrawals', adminMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT w.id, w.amount_cents, w.iban, w.status, w.created_at,
+             u.display_name, u.email
+      FROM withdrawals w
+      JOIN users u ON u.id = w.user_id
+      ORDER BY w.created_at DESC
+      LIMIT 200
+    `);
+    res.json({ withdrawals: r.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Kunde inte hämta uttag' });
+  }
+});
+
+// Admin: markera uttag som hanterat
+app.post('/api/admin/withdrawals/:id/complete', adminMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM withdrawals WHERE id=$1', [req.params.id]);
+    const w = r.rows[0];
+    if (!w) return res.status(404).json({ error: 'Uttag hittades inte' });
+    if (w.status === 'completed') return res.status(400).json({ error: 'Redan hanterat' });
+
+    await pool.query('UPDATE withdrawals SET status=$1, completed_at=NOW() WHERE id=$2', ['completed', w.id]);
+    await pool.query(
+      'UPDATE transactions SET status=$1 WHERE user_id=$2 AND type=$3 AND status=$4',
+      ['completed', w.user_id, 'withdrawal_pending', 'pending']
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Kunde inte markera som hanterat' });
+  }
+});
+
+// Admin: avbryt uttag (återbetala saldot till spelaren)
+app.post('/api/admin/withdrawals/:id/cancel', adminMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM withdrawals WHERE id=$1', [req.params.id]);
+    const w = r.rows[0];
+    if (!w) return res.status(404).json({ error: 'Uttag hittades inte' });
+    if (w.status !== 'pending') return res.status(400).json({ error: 'Kan bara avbryta pending uttag' });
+
+    // Återbetala saldot
+    await pool.query('UPDATE users SET balance_cents = balance_cents + $1 WHERE id=$2', [w.amount_cents, w.user_id]);
+    await pool.query('UPDATE withdrawals SET status=$1 WHERE id=$2', ['cancelled', w.id]);
+    await pool.query(
+      'UPDATE transactions SET status=$1 WHERE user_id=$2 AND type=$3 AND status=$4',
+      ['cancelled', w.user_id, 'withdrawal_pending', 'pending']
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Kunde inte avbryta uttag' });
+  }
+});
 
 let openChallenges = [];
 let activeMatches = {};
