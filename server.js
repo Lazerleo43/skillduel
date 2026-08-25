@@ -754,7 +754,7 @@ function runMatchLoop(matchId){
         if(!mm.timeoutCount) mm.timeoutCount={0:0,1:0};
         mm.timeoutCount[loserTeam]++;
         console.log(`Server timeout team ${loserTeam}: ${mm.timeoutCount[loserTeam]}`);
-        if(mm.timeoutCount[loserTeam]>=3){
+        if(mm.timeoutCount[loserTeam]>=2){
           // 2 timeouts → forfeit
           forfeitMatch(matchId,mm,loserSocketId,'timeout').catch(console.error);
           return;
@@ -949,7 +949,8 @@ io.on('connection',(socket)=>{
     if(!disc)return;
     disc.vx=data.vx;
     disc.vy=data.vy;
-    // Nolla timeout-räknaren och turn-timern för spelaren som faktiskt sköt
+    // Nolla timeout-räknaren för spelaren som sköt
+    // (motståndarens räknare nollas INTE — den nollas bara när de själva skjuter)
     const team = match.player1===socket.id ? match.player1Team : match.player2Team;
     if(match.timeoutCount) match.timeoutCount[team]=0;
     match.turnTimerActive=false;
