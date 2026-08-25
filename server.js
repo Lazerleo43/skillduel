@@ -754,7 +754,7 @@ function runMatchLoop(matchId){
         if(!mm.timeoutCount) mm.timeoutCount={0:0,1:0};
         mm.timeoutCount[loserTeam]++;
         console.log(`Server timeout team ${loserTeam}: ${mm.timeoutCount[loserTeam]}`);
-        if(mm.timeoutCount[loserTeam]>=2){
+        if(mm.timeoutCount[loserTeam]>=3){
           // 2 timeouts → forfeit
           forfeitMatch(matchId,mm,loserSocketId,'timeout').catch(console.error);
           return;
