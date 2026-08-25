@@ -776,6 +776,58 @@ async function settleMatch(matchId,mm){
   delete activeMatches[matchId];
 }
 
+// Forfeit: en spelare lämnar eller timeout:ar 2 gånger — motståndaren vinner hela potten
+async function forfeitMatch(matchId, mm, loserSocketId, reason){
+  if(!activeMatches[matchId]) return; // redan avgjord
+  clearInterval(mm.interval);
+  delete activeMatches[matchId];
+
+  const isP1Loser = mm.player1 === loserSocketId;
+  const winnerSocketId = isP1Loser ? mm.player2 : mm.player1;
+  const winnerUserId = isP1Loser ? mm.player2UserId : mm.player1UserId;
+  const loserUserId = isP1Loser ? mm.player1UserId : mm.player2UserId;
+  const stakeCents = Math.round(mm.stake * 100);
+  const potCents = stakeCents * 2;
+  const rakeCents = Math.round(potCents * RAKE_PCT);
+  const payoutCents = potCents - rakeCents;
+
+  try {
+    if(winnerUserId && loserUserId && stakeCents > 0){
+      await pool.query('UPDATE users SET balance_cents = balance_cents + $1 WHERE id=$2',[payoutCents, winnerUserId]);
+      await pool.query('INSERT INTO transactions (user_id, type, amount_cents, status) VALUES ($1,$2,$3,$4)',[winnerUserId,'match_win',payoutCents,'completed']);
+      await pool.query('INSERT INTO transactions (user_id, type, amount_cents, status) VALUES ($1,$2,$3,$4)',[loserUserId,'match_loss',-stakeCents,'completed']);
+      await pool.query('UPDATE house_account SET balance_cents = balance_cents + $1 WHERE id=1',[rakeCents]);
+    }
+  } catch(e){ console.error('Fel vid forfeit-avräkning:',e); }
+
+  const winnerBalance = winnerUserId ? await pool.query('SELECT balance_cents FROM users WHERE id=$1',[winnerUserId]) : null;
+  const loserBalance = loserUserId ? await pool.query('SELECT balance_cents FROM users WHERE id=$1',[loserUserId]) : null;
+
+  const reasonMsg = reason === 'timeout' ? 'Motståndaren fick timeout för många gånger' :
+                    reason === 'forfeit' ? 'Motståndaren lämnade matchen' :
+                    'Motståndaren kopplades bort';
+
+  // Meddela vinnaren
+  io.to(winnerSocketId).emit('match_forfeit_win', {
+    reason: reasonMsg,
+    payoutCents,
+    newBalanceCents: winnerBalance ? winnerBalance.rows[0].balance_cents : null
+  });
+
+  // Meddela förloraren (om fortfarande ansluten)
+  io.to(loserSocketId).emit('match_forfeit_loss', {
+    reason: reason === 'timeout' ? 'Du fick timeout för många gånger och förlorade matchen' : 'Du lämnade matchen'
+  });
+
+  // Spara i databasen
+  try {
+    await pool.query(
+      `UPDATE matches SET final_score_p1=$1, final_score_p2=$2, winner_user_id=$3, rake_cents=$4, ended_at=NOW() WHERE match_id=$5`,
+      [mm.score[0], mm.score[1], winnerUserId||null, rakeCents, matchId]
+    );
+  } catch(e){ console.error('Kunde inte spara forfeit i databasen:',e); }
+}
+
 io.on('connection',(socket)=>{
   console.log('Ansluten:',socket.id);
 
@@ -834,7 +886,9 @@ io.on('connection',(socket)=>{
       stake:challenge.stake,score:[0,0],
       ball:{x:170,y:290,vx:0,vy:0,r:BALL_R},
       discs,goalCooldown:0,turn:0,wasStopped:true,
-      ballTouched:false,events:[],matchStartTime:Date.now()
+      ballTouched:false,events:[],matchStartTime:Date.now(),
+      // Timeout-räknare: om en spelare låter tiden rinna ut 2 gånger i rad → förlust
+      timeoutCount:{ 0:0, 1:0 }
     };
     io.to(challenge.socketId).emit('match_start',{matchId,role:'player1',opponent:data.name,stake:challenge.stake});
     io.to(socket.id).emit('match_start',{matchId,role:'player2',opponent:challenge.name,stake:challenge.stake});
@@ -858,12 +912,45 @@ io.on('connection',(socket)=>{
     if(!disc)return;
     disc.vx=data.vx;
     disc.vy=data.vy;
+    // Nolla timeout-räknaren för den spelare som faktiskt sköt
+    const team = match.player1===socket.id ? match.player1Team : match.player2Team;
+    if(match.timeoutCount) match.timeoutCount[team] = 0;
     match.events.push({t:Date.now()-match.matchStartTime,type:'shot',discId:data.discId,x:disc.x,y:disc.y,vx:data.vx,vy:data.vy});
+  });
+
+  // Klienten rapporterar timeout (30s-timern gick ut)
+  // Om samma spelare timeout:ar 2 gånger i rad → förlust/forfeit
+  socket.on('player_timeout',(data)=>{
+    const match=activeMatches[data.matchId];
+    if(!match) return;
+    const isP1 = match.player1===socket.id;
+    const myTeam = isP1 ? match.player1Team : match.player2Team;
+    if(!match.timeoutCount) match.timeoutCount={0:0,1:0};
+    match.timeoutCount[myTeam]++;
+    console.log(`Timeout räknare team ${myTeam}: ${match.timeoutCount[myTeam]}`);
+    if(match.timeoutCount[myTeam] >= 2){
+      // 2 timeouts i rad → forfeit, motståndaren vinner
+      const winnerSocketId = isP1 ? match.player2 : match.player1;
+      forfeitMatch(data.matchId, match, socket.id, 'timeout').catch(console.error);
+    }
+  });
+
+  // Spelaren klickar aktivt på "Lämna" → direkt forfeit
+  socket.on('forfeit_match',(data)=>{
+    const match=activeMatches[data.matchId];
+    if(!match) return;
+    forfeitMatch(data.matchId, match, socket.id, 'forfeit').catch(console.error);
   });
 
   socket.on('disconnect',()=>{
     openChallenges=openChallenges.filter(c=>c.socketId!==socket.id);
     io.emit('challenges_list',openChallenges);
+    // Om spelaren kopplar bort mitt i match → forfeit
+    Object.entries(activeMatches).forEach(([matchId, match])=>{
+      if(match.player1===socket.id || match.player2===socket.id){
+        forfeitMatch(matchId, match, socket.id, 'disconnect').catch(console.error);
+      }
+    });
     console.log('Frånkopplad:',socket.id);
   });
 });
