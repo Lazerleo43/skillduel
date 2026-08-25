@@ -766,6 +766,7 @@ function runMatchLoop(matchId){
           const angle=Math.random()*Math.PI*2;
           d.vx=Math.cos(angle)*4; d.vy=Math.sin(angle)*4;
           mm.events.push({t:Date.now()-mm.matchStartTime,type:'shot',discId:d.id,x:d.x,y:d.y,vx:d.vx,vy:d.vy});
+          mm.wasStopped=false; // viktigt — låter loopen känna av att rörelse startat
         }
       }
     }
