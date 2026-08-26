@@ -533,6 +533,114 @@ app.get('/api/transactions', authMiddleware, async (req, res) => {
 
 // ============ ADMIN ============
 
+// Admin: alla spelare med statistik
+app.get('/api/admin/players', adminMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT u.id, u.email, u.display_name, u.balance_cents, u.age_verified, u.created_at,
+        COUNT(DISTINCT m.id) as match_count,
+        COALESCE(SUM(CASE WHEN t.type='deposit' AND t.status='completed' THEN t.amount_cents ELSE 0 END),0) as total_deposited,
+        COALESCE(SUM(CASE WHEN t.type='withdrawal_pending' THEN ABS(t.amount_cents) ELSE 0 END),0) as total_withdrawn,
+        0 as warning_count
+      FROM users u
+      LEFT JOIN matches m ON (m.player1_user_id=u.id OR m.player2_user_id=u.id)
+      LEFT JOIN transactions t ON t.user_id=u.id
+      WHERE u.is_admin=FALSE
+      GROUP BY u.id
+      ORDER BY u.created_at DESC
+    `);
+    res.json({ players: r.rows });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Fel' }); }
+});
+
+// Admin: en spelares fullständiga profil
+app.get('/api/admin/players/:userId', adminMiddleware, async (req, res) => {
+  try {
+    const uid = parseInt(req.params.userId);
+    const playerR = await pool.query(`
+      SELECT u.*,
+        COUNT(DISTINCT m.id) as match_count,
+        COALESCE(SUM(CASE WHEN m.winner_user_id=u.id THEN 1 ELSE 0 END),0) as wins,
+        COALESCE(SUM(CASE WHEN (m.player1_user_id=u.id OR m.player2_user_id=u.id) AND m.winner_user_id IS NOT NULL AND m.winner_user_id!=u.id THEN 1 ELSE 0 END),0) as losses,
+        COALESCE(SUM(CASE WHEN t.type='deposit' AND t.status='completed' THEN t.amount_cents ELSE 0 END),0) as total_deposited,
+        COALESCE(SUM(CASE WHEN t.type='withdrawal_pending' THEN ABS(t.amount_cents) ELSE 0 END),0) as total_withdrawn
+      FROM users u
+      LEFT JOIN matches m ON (m.player1_user_id=u.id OR m.player2_user_id=u.id)
+      LEFT JOIN transactions t ON t.user_id=u.id
+      WHERE u.id=$1 GROUP BY u.id
+    `, [uid]);
+    if(!playerR.rows[0]) return res.status(404).json({ error: 'Spelare ej hittad' });
+
+    const matchesR = await pool.query(`
+      SELECT m.*, p1.display_name as player1_name, p2.display_name as player2_name
+      FROM matches m
+      LEFT JOIN users p1 ON p1.id=m.player1_user_id
+      LEFT JOIN users p2 ON p2.id=m.player2_user_id
+      WHERE m.player1_user_id=$1 OR m.player2_user_id=$1
+      ORDER BY m.started_at DESC LIMIT 50
+    `, [uid]);
+
+    const txR = await pool.query(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50`, [uid]);
+
+    // AML-varningar
+    const warnings = [];
+    const opR = await pool.query(`
+      SELECT CASE WHEN player1_user_id=$1 THEN player2_user_id ELSE player1_user_id END as opp_id, COUNT(*) as cnt,
+        CASE WHEN player1_user_id=$1 THEN (SELECT display_name FROM users WHERE id=player2_user_id)
+             ELSE (SELECT display_name FROM users WHERE id=player1_user_id) END as opp_name
+      FROM matches WHERE (player1_user_id=$1 OR player2_user_id=$1) AND ended_at IS NOT NULL
+      GROUP BY opp_id, opp_name HAVING COUNT(*) > 3 ORDER BY cnt DESC
+    `, [uid]);
+    opR.rows.forEach(o => warnings.push({ title:'Upprepade matcher mot samma spelare', description:`${o.cnt} matcher mot ${o.opp_name}. Kan indikera koordinerat spelande.`, severity: o.cnt>8?'high':'medium' }));
+
+    const rapidR = await pool.query(`
+      SELECT COUNT(*) as cnt FROM transactions d
+      JOIN transactions w ON w.user_id=d.user_id AND w.type='withdrawal_pending'
+        AND w.created_at BETWEEN d.created_at AND d.created_at + INTERVAL '24 hours'
+      WHERE d.user_id=$1 AND d.type='deposit' AND d.status='completed' AND d.amount_cents>50000
+    `, [uid]);
+    if(rapidR.rows[0].cnt > 0) warnings.push({ title:'Snabb insättning och uttag', description:`Insättning följt av uttag inom 24h vid ${rapidR.rows[0].cnt} tillfälle(n).`, severity:'high' });
+
+    const p = playerR.rows[0];
+    if(p.match_count > 5 && p.wins/p.match_count > 0.8) warnings.push({ title:'Ovanligt hög vinst-ratio', description:`Vinner ${Math.round(p.wins/p.match_count*100)}% av matcher (${p.wins}/${p.match_count}).`, severity: p.wins/p.match_count>0.9?'high':'medium' });
+
+    res.json({ player: p, matches: matchesR.rows, transactions: txR.rows, warnings });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Fel' }); }
+});
+
+// Admin: globala AML-varningar
+app.get('/api/admin/warnings', adminMiddleware, async (req, res) => {
+  try {
+    const warnings = [];
+    const opR = await pool.query(`
+      SELECT player1_user_id, player2_user_id, COUNT(*) as cnt, p1.display_name as p1_name, p2.display_name as p2_name
+      FROM matches m JOIN users p1 ON p1.id=m.player1_user_id JOIN users p2 ON p2.id=m.player2_user_id
+      WHERE m.ended_at IS NOT NULL GROUP BY player1_user_id, player2_user_id, p1.display_name, p2.display_name
+      HAVING COUNT(*) > 5 ORDER BY cnt DESC
+    `);
+    opR.rows.forEach(r => warnings.push({ title:'Misstänkt upprepat matchmönster', description:`${r.p1_name} och ${r.p2_name} har spelat ${r.cnt} gånger mot varandra.`, severity:r.cnt>10?'high':'medium', players:[r.p1_name,r.p2_name], userId:r.player1_user_id }));
+
+    const rapidR = await pool.query(`
+      SELECT u.id, u.display_name, COUNT(*) as cnt FROM transactions d
+      JOIN transactions w ON w.user_id=d.user_id AND w.type='withdrawal_pending' AND w.created_at BETWEEN d.created_at AND d.created_at + INTERVAL '24 hours'
+      JOIN users u ON u.id=d.user_id
+      WHERE d.type='deposit' AND d.status='completed' AND d.amount_cents>50000
+      GROUP BY u.id, u.display_name HAVING COUNT(*) > 0
+    `);
+    rapidR.rows.forEach(r => warnings.push({ title:'Snabb insättning och uttag', description:`${r.display_name} har satt in och tagit ut snabbt vid ${r.cnt} tillfälle(n).`, severity:'high', players:[r.display_name], userId:r.id }));
+
+    const winR = await pool.query(`
+      SELECT u.id, u.display_name, COUNT(m.id) as total, SUM(CASE WHEN m.winner_user_id=u.id THEN 1 ELSE 0 END) as wins
+      FROM users u JOIN matches m ON (m.player1_user_id=u.id OR m.player2_user_id=u.id)
+      WHERE m.ended_at IS NOT NULL AND u.is_admin=FALSE
+      GROUP BY u.id, u.display_name HAVING COUNT(m.id) > 5 AND SUM(CASE WHEN m.winner_user_id=u.id THEN 1 ELSE 0 END)::float/COUNT(m.id) > 0.8
+    `);
+    winR.rows.forEach(r => { const ratio=Math.round(r.wins/r.total*100); warnings.push({ title:'Ovanligt hög vinst-ratio', description:`${r.display_name} vinner ${ratio}% av sina matcher (${r.wins}/${r.total}).`, severity:ratio>90?'high':'medium', players:[r.display_name], userId:r.id }); });
+
+    res.json({ warnings });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Fel' }); }
+});
+
 app.get('/api/admin/matches', adminMiddleware, async (req, res) => {
   try {
     const r = await pool.query(`
@@ -725,6 +833,9 @@ async function sendMatchNotification(challengerUserId, stake) {
       'SELECT * FROM push_subscriptions WHERE user_id != $1',
       [challengerUserId]
     );
+    console.log(`Push: ${subs.rows.length} prenumeranter att notifiera (challenger: ${challengerUserId})`);
+    if(!subs.rows.length){ console.log('Push: inga prenumeranter — ingen notis skickad'); return; }
+
     const payload = JSON.stringify({
       title: '⚽ Toosome — Match tillgänglig!',
       body: `En spelare söker match om ${stake} kr. Vinnaren får ${Math.round(stake * 1.95)} kr!`,
@@ -737,7 +848,9 @@ async function sendMatchNotification(challengerUserId, stake) {
           endpoint: sub.endpoint,
           keys: { p256dh: sub.p256dh, auth: sub.auth }
         }, payload);
+        console.log(`Push: notis skickad till user ${sub.user_id} OK`);
       } catch(e) {
+        console.error(`Push: fel för user ${sub.user_id}:`, e.statusCode, e.message);
         if(e.statusCode === 404 || e.statusCode === 410) {
           failed.push(sub.endpoint);
         }
@@ -745,6 +858,7 @@ async function sendMatchNotification(challengerUserId, stake) {
     }
     if(failed.length) {
       await pool.query('DELETE FROM push_subscriptions WHERE endpoint = ANY($1)', [failed]);
+      console.log(`Push: rensade ${failed.length} utgångna prenumerationer`);
     }
   } catch(e) {
     console.error('Push notification error:', e);
