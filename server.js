@@ -5,6 +5,12 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const Stripe = require('stripe');
+const webpush = require('web-push');
+
+// VAPID-nycklar för push-notifikationer
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC || 'BNpedrL3rMY4Y_Pvy4IeQga92AKZtlni5vcx2tEzDz0KWy7XjXqeF9VAUdun5hZUEgswOZwlcIZNufxTeHrWdP4';
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE || 'MKML6ZL2ncMCradt6CDLGrYqceUmZVDSZKIqHmvHE78';
+webpush.setVapidDetails('mailto:leo.ekengren04@gmail.com', VAPID_PUBLIC, VAPID_PRIVATE);
 
 const app = express();
 app.use(cors());
@@ -239,6 +245,18 @@ async function initDb() {
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       completed_at TIMESTAMP
+    );
+  `);
+
+  // Push-prenumerationer för web push-notifikationer
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      endpoint TEXT NOT NULL UNIQUE,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
   `);
   console.log('Databas redo');
@@ -677,6 +695,62 @@ app.post('/api/admin/withdrawals/:id/cancel', adminMiddleware, async (req, res) 
   }
 });
 
+// ============ PUSH-NOTIFIKATIONER ============
+
+app.get('/api/push/vapid-public-key', (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC });
+});
+
+app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const { endpoint, keys } = req.body;
+    if(!endpoint || !keys || !keys.p256dh || !keys.auth) {
+      return res.status(400).json({ error: 'Ogiltig prenumeration' });
+    }
+    await pool.query(`
+      INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (endpoint) DO UPDATE SET user_id=$1, p256dh=$3, auth=$4
+    `, [req.userId, endpoint, keys.p256dh, keys.auth]);
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('Push subscribe error:', e);
+    res.status(500).json({ error: 'Kunde inte spara prenumeration' });
+  }
+});
+
+async function sendMatchNotification(challengerUserId, stake) {
+  try {
+    const subs = await pool.query(
+      'SELECT * FROM push_subscriptions WHERE user_id != $1',
+      [challengerUserId]
+    );
+    const payload = JSON.stringify({
+      title: '⚽ Toosome — Match tillgänglig!',
+      body: `En spelare söker match om ${stake} kr. Vinnaren får ${Math.round(stake * 1.95)} kr!`,
+      url: 'https://toosome.com'
+    });
+    const failed = [];
+    for(const sub of subs.rows) {
+      try {
+        await webpush.sendNotification({
+          endpoint: sub.endpoint,
+          keys: { p256dh: sub.p256dh, auth: sub.auth }
+        }, payload);
+      } catch(e) {
+        if(e.statusCode === 404 || e.statusCode === 410) {
+          failed.push(sub.endpoint);
+        }
+      }
+    }
+    if(failed.length) {
+      await pool.query('DELETE FROM push_subscriptions WHERE endpoint = ANY($1)', [failed]);
+    }
+  } catch(e) {
+    console.error('Push notification error:', e);
+  }
+}
+
 let openChallenges = [];
 let activeMatches = {};
 const W=340,H=580,PL=20,PR=320,PT=44,PB=536,GTL=126,GBL=214,GW=20,DISC_R=18,BALL_R=11,FRICTION=0.985,WALL_B=0.55,WIN=3;
@@ -877,6 +951,8 @@ io.on('connection',(socket)=>{
     openChallenges.push({id:socket.id,name:data.name,stake:data.stake,socketId:socket.id,userId:data.userId});
     io.emit('challenges_list',openChallenges);
     io.emit('new_challenge',{name:data.name,stake:data.stake});
+    // Skicka push-notis till alla registrerade spelare (utom den som skapade utmaningen)
+    if(data.userId) sendMatchNotification(data.userId, data.stake).catch(console.error);
   });
 
   socket.on('cancel_challenge',()=>{
